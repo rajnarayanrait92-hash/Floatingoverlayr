@@ -1,0 +1,444 @@
+name: Make APK 3
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FloatingOverlay"
+          include(":app")
+          EOF
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          kotlin.code.style=official
+          EOF
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.overlayapp"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.overlayapp"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="Floating Overlay"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="floating_overlay" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p $(dirname app/src/main/java/com/example/overlayapp/MainActivity.kt)
+          cat > app/src/main/java/com/example/overlayapp/MainActivity.kt <<'EOF'
+          package com.example.overlayapp
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(pad, pad, pad, pad)
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "Floating Overlay"
+                      textSize = 24f
+                      gravity = Gravity.CENTER
+                  })
+
+                  root.addView(Button(this).apply {
+                      text = "Overlay शुरू करें"
+                      setOnClickListener { startOverlay() }
+                  })
+
+                  root.addView(Button(this).apply {
+                      text = "Overlay बंद करें"
+                      setOnClickListener { stopService(Intent(this@MainActivity, OverlayService::class.java)) }
+                  })
+
+                  setContentView(root)
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+              }
+
+              private fun startOverlay() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "\"Display over other apps\" की permission दें, फिर वापस आकर बटन दबाएँ", Toast.LENGTH_LONG).show()
+                      startActivity(
+                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                      )
+                      return
+                  }
+                  startForegroundService(Intent(this, OverlayService::class.java))
+              }
+          }
+          EOF
+          mkdir -p $(dirname app/src/main/java/com/example/overlayapp/OverlayService.kt)
+          cat > app/src/main/java/com/example/overlayapp/OverlayService.kt <<'EOF'
+          package com.example.overlayapp
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.math.abs
+
+          class OverlayService : Service() {
+
+              private lateinit var wm: WindowManager
+              private var bubble: View? = null
+              private var panel: View? = null
+              private lateinit var bubbleLp: WindowManager.LayoutParams
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var timerText: TextView? = null
+              private var clockText: TextView? = null
+              private var running = false
+              private var startMs = 0L
+              private var elapsedMs = 0L
+
+              private val ticker = object : Runnable {
+                  override fun run() {
+                      refreshTexts()
+                      handler.postDelayed(this, 100)
+                  }
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val channelId = "overlay_channel"
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel(channelId, "Overlay", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val notification = Notification.Builder(this, channelId)
+                      .setContentTitle("Overlay चालू है")
+                      .setSmallIcon(android.R.drawable.ic_menu_myplaces)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, notification)
+                  }
+
+                  if (bubble == null) showBubble()
+                  return START_STICKY
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun newParams(w: Int, h: Int) = WindowManager.LayoutParams(
+                  w, h,
+                  WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                  PixelFormat.TRANSLUCENT
+              ).apply { gravity = Gravity.TOP or Gravity.START }
+
+              private fun showBubble() {
+                  val size = dp(56)
+                  val v = TextView(this).apply {
+                      text = "☰"
+                      textSize = 22f
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(Color.argb(210, 30, 136, 229))
+                      }
+                  }
+                  bubbleLp = newParams(size, size).apply { x = dp(16); y = dp(200) }
+
+                  var initX = 0; var initY = 0
+                  var touchX = 0f; var touchY = 0f
+                  var moved = false
+
+                  v.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              initX = bubbleLp.x; initY = bubbleLp.y
+                              touchX = e.rawX; touchY = e.rawY
+                              moved = false
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = e.rawX - touchX
+                              val dy = e.rawY - touchY
+                              if (abs(dx) > 10 || abs(dy) > 10) moved = true
+                              if (moved) {
+                                  bubbleLp.x = initX + dx.toInt()
+                                  bubbleLp.y = initY + dy.toInt()
+                                  wm.updateViewLayout(bubble, bubbleLp)
+                                  panel?.let { p ->
+                                      (p.layoutParams as WindowManager.LayoutParams).apply {
+                                          x = bubbleLp.x + size + dp(8)
+                                          y = bubbleLp.y
+                                      }.also { wm.updateViewLayout(p, it) }
+                                  }
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> if (!moved) togglePanel()
+                      }
+                      true
+                  }
+
+                  bubble = v
+                  wm.addView(v, bubbleLp)
+                  handler.post(ticker)
+              }
+
+              private fun togglePanel() {
+                  panel?.let {
+                      wm.removeView(it)
+                      panel = null
+                      timerText = null
+                      clockText = null
+                      return
+                  }
+
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(12), dp(12), dp(12), dp(12))
+                      background = GradientDrawable().apply {
+                          cornerRadius = dp(12).toFloat()
+                          setColor(Color.argb(235, 35, 35, 35))
+                      }
+                  }
+
+                  clockText = TextView(this).apply { setTextColor(Color.LTGRAY); textSize = 14f }
+                  timerText = TextView(this).apply { setTextColor(Color.WHITE); textSize = 22f }
+                  layout.addView(clockText)
+                  layout.addView(timerText)
+
+                  val status = TextView(this).apply { setTextColor(Color.YELLOW); textSize = 13f }
+                  val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val circles = ArrayList<TextView>()
+                  fun paint(c: TextView, color: Int) {
+                      c.background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(color)
+                      }
+                  }
+                  for (label in listOf("\uD83D\uDC41", "\u2744", "\u27A4")) {
+                      val c = TextView(this).apply {
+                          text = label
+                          textSize = 20f
+                          gravity = Gravity.CENTER
+                          layoutParams = LinearLayout.LayoutParams(dp(48), dp(48)).apply {
+                              setMargins(dp(4), dp(8), dp(4), dp(8))
+                          }
+                      }
+                      paint(c, Color.GRAY)
+                      c.setOnClickListener {
+                          if (c.tag == true) {
+                              c.tag = false
+                              paint(c, Color.GRAY)
+                              status.text = "\u092C\u0902\u0926"
+                          } else {
+                              c.tag = true
+                              paint(c, Color.rgb(46, 160, 67))
+                              status.text = "\u091A\u093E\u0932\u0942 \u2714"
+                          }
+                      }
+                      circles.add(c)
+                      row.addView(c)
+                  }
+                  layout.addView(row)
+                  layout.addView(status)
+
+                  val startStop = Button(this).apply {
+                      text = if (running) "Stop" else "Start"
+                      setOnClickListener {
+                          if (running) {
+                              elapsedMs += SystemClock.elapsedRealtime() - startMs
+                              running = false
+                          } else {
+                              startMs = SystemClock.elapsedRealtime()
+                              running = true
+                          }
+                          text = if (running) "Stop" else "Start"
+                      }
+                  }
+                  val reset = Button(this).apply {
+                      text = "Reset"
+                      setOnClickListener {
+                          running = false
+                          elapsedMs = 0
+                          startStop.text = "Start"
+                          refreshTexts()
+                      }
+                  }
+                  val close = Button(this).apply {
+                      text = "Overlay बंद करें"
+                      setOnClickListener { stopSelf() }
+                  }
+                  layout.addView(startStop)
+                  layout.addView(reset)
+                  layout.addView(close)
+
+                  val lp = newParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT)
+                      .apply { x = bubbleLp.x + dp(56) + dp(8); y = bubbleLp.y }
+                  panel = layout
+                  wm.addView(layout, lp)
+                  refreshTexts()
+              }
+
+              private fun refreshTexts() {
+                  val total = elapsedMs + if (running) SystemClock.elapsedRealtime() - startMs else 0L
+                  val s = total / 1000
+                  timerText?.text = String.format(Locale.US, "%02d:%02d.%d", s / 60, s % 60, (total % 1000) / 100)
+                  clockText?.text = SimpleDateFormat("hh:mm:ss a", Locale.getDefault()).format(Date())
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacks(ticker)
+                  panel?.let { wm.removeView(it) }
+                  bubble?.let { wm.removeView(it) }
+                  panel = null; bubble = null
+                  super.onDestroy()
+              }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Accept Android licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+      - name: Build debug APK
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FloatingOverlay-v3-apk
+          path: app/build/outputs/apk/debug/*.apk
